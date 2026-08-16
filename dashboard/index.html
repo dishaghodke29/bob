@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>BOB — Robot Control</title>
+  <meta name="description" content="BOB multimodal robot remote control dashboard — live camera, joystick, AI chat and sensor telemetry." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/css/style.css" />
+</head>
+<body>
+
+  <!-- ── Top bar ─────────────────────────────────────────────────────── -->
+  <header class="topbar">
+    <div class="topbar-left">
+      <div class="bob-logo">
+        <span class="logo-eye left"></span>
+        <span class="logo-eye right"></span>
+      </div>
+      <div class="brand">
+        <span class="brand-name">B·O·B</span>
+        <span class="brand-sub">Edge AI Robot</span>
+      </div>
+    </div>
+
+    <div class="topbar-center">
+      <div class="status-pill" id="conn-status">
+        <span class="status-dot" id="status-dot"></span>
+        <span id="status-text">Connecting…</span>
+      </div>
+      <div class="state-badge" id="state-badge">IDLE</div>
+    </div>
+
+    <div class="topbar-right">
+      <button class="btn-estop" id="btn-estop" title="Emergency Stop">
+        ⬛ E-STOP
+      </button>
+    </div>
+  </header>
+
+  <!-- ── Main grid ───────────────────────────────────────────────────── -->
+  <main class="grid">
+
+    <!-- ── LEFT COLUMN ─────────────────────────────────────────────── -->
+    <section class="col-left">
+
+      <!-- Camera feed -->
+      <div class="card camera-card">
+        <div class="card-label">CAMERA</div>
+        <div class="camera-wrap">
+          <img id="camera-feed" src="/video_feed" alt="Camera" />
+          <div class="camera-overlay" id="camera-overlay">
+            <span>No signal</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Joystick + mode -->
+      <div class="card joystick-card">
+        <div class="card-label">DRIVE  <span class="mode-tag" id="mode-tag">MANUAL</span></div>
+        <div class="joystick-row">
+          <!-- Mecanum joystick -->
+          <div class="joystick-wrap">
+            <canvas id="joystick" width="180" height="180"></canvas>
+            <div class="joystick-hint">drag to move</div>
+          </div>
+
+          <!-- Rotation slider -->
+          <div class="rotate-wrap">
+            <div class="rotate-label">↺ ROTATE ↻</div>
+            <input type="range" id="rotate-slider"
+                   min="-255" max="255" value="0"
+                   class="rotate-range" />
+            <div class="rotate-val" id="rotate-val">0</div>
+          </div>
+
+          <!-- Quick buttons -->
+          <div class="quick-btns">
+            <button class="qbtn" id="btn-auto" title="Auto mode">🤖 Auto</button>
+            <button class="qbtn" id="btn-stop" title="Stop motors">⏹ Stop</button>
+            <button class="qbtn" id="btn-calib" title="Calibrate IMU">🔄 Calib</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Emotion panel -->
+      <div class="card emotion-card">
+        <div class="card-label">BOB'S FACE</div>
+        <div class="emotion-grid" id="emotion-grid">
+          <!-- filled by JS -->
+        </div>
+      </div>
+
+    </section>
+
+    <!-- ── MIDDLE COLUMN ────────────────────────────────────────────── -->
+    <section class="col-mid">
+
+      <!-- Chat -->
+      <div class="card chat-card">
+        <div class="card-label">CHAT WITH BOB</div>
+        <div class="chat-messages" id="chat-messages">
+          <div class="msg bob-msg">
+            <span class="msg-name">BOB</span>
+            <span class="msg-text">Hey! I'm BOB. Drive me around or just say hi! 👋</span>
+          </div>
+        </div>
+        <form class="chat-input-row" id="chat-form" autocomplete="off">
+          <input type="text" id="chat-input"
+                 placeholder="Type a message…" maxlength="200" />
+          <button type="submit" class="btn-send" id="btn-send">Send</button>
+        </form>
+      </div>
+
+    </section>
+
+    <!-- ── RIGHT COLUMN ─────────────────────────────────────────────── -->
+    <section class="col-right">
+
+      <!-- IMU telemetry -->
+      <div class="card imu-card">
+        <div class="card-label">IMU — MPU-6050</div>
+        <div class="imu-gauges">
+          <div class="gauge-wrap">
+            <div class="gauge-label">ROLL</div>
+            <canvas id="roll-gauge" width="110" height="110"></canvas>
+            <div class="gauge-val" id="roll-val">0.0°</div>
+          </div>
+          <div class="gauge-wrap">
+            <div class="gauge-label">PITCH</div>
+            <canvas id="pitch-gauge" width="110" height="110"></canvas>
+            <div class="gauge-val" id="pitch-val">0.0°</div>
+          </div>
+        </div>
+        <div class="accel-row">
+          <div class="accel-item"><span class="ax">AX</span><span id="ax-val">0.00</span><span class="ag">g</span></div>
+          <div class="accel-item"><span class="ax">AY</span><span id="ay-val">0.00</span><span class="ag">g</span></div>
+          <div class="accel-item"><span class="ax">AZ</span><span id="az-val">1.00</span><span class="ag">g</span></div>
+        </div>
+      </div>
+
+      <!-- Depth sensor -->
+      <div class="card tof-card">
+        <div class="card-label">DEPTH — VL53L5CX  <span class="tof-dist" id="tof-dist">—</span></div>
+        <canvas id="tof-canvas" width="240" height="240"></canvas>
+        <div class="tof-scale">
+          <span>0 cm</span>
+          <div class="tof-gradient"></div>
+          <span>200 cm</span>
+        </div>
+      </div>
+
+      <!-- System stats -->
+      <div class="card stats-card">
+        <div class="card-label">SYSTEM</div>
+        <div class="stats-grid">
+          <div class="stat-item">
+            <span class="stat-lbl">OBSTACLE</span>
+            <span class="stat-val" id="obstacle-val">— cm</span>
+          </div>
+          <div class="stat-item">
+            <span class="stat-lbl">E-STOP</span>
+            <span class="stat-val" id="estop-val">OFF</span>
+          </div>
+          <div class="stat-item">
+            <span class="stat-lbl">IMU</span>
+            <span class="stat-val" id="imu-ok-val">—</span>
+          </div>
+          <div class="stat-item">
+            <span class="stat-lbl">LLM</span>
+            <span class="stat-val" id="llm-val">—</span>
+          </div>
+        </div>
+      </div>
+
+    </section>
+  </main>
+
+  <script src="/static/js/joystick.js"></script>
+  <script src="/static/js/gauges.js"></script>
+  <script src="/static/js/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,37 @@
+{
+  "name": "BOB Robot",
+  "short_name": "BOB",
+  "description": "BOB multimodal robot remote control — camera, joystick, AI chat and home automation.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0b0d14",
+  "theme_color": "#f5c800",
+  "orientation": "any",
+  "icons": [
+    {
+      "src": "/static/icons/bob-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/static/icons/bob-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ],
+  "categories": ["utilities", "productivity"],
+  "shortcuts": [
+    {
+      "name": "Camera",
+      "url": "/?view=camera",
+      "description": "Jump to live camera feed"
+    },
+    {
+      "name": "Drive",
+      "url": "/?view=drive",
+      "description": "Drive BOB"
+    }
+  ]
+}
