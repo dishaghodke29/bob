@@ -214,7 +214,7 @@ class ToFSensor:
 
         logger.debug(
             "ToF read: min=%.1f cm, max=%.1f cm",
-            min(v for v in cm_values if v > 0, default=0.0),
+            min((v for v in cm_values if v > 0), default=0.0),
             max(cm_values),
         )
         return cm_values
