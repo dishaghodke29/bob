@@ -24,38 +24,36 @@ log = logging.getLogger("llm_agent")
 # ── Paths ──────────────────────────────────────────────────────────────────
 LLAMA_SERVER_BIN = Path("/home/arduino/bob/llama.cpp/build/bin/llama-server")
 LLAMA_LIBS_DIR   = Path("/home/arduino/bob/llama.cpp/build/bin")
-MODEL_PATH       = Path("/home/arduino/bob/models/bob_llm.gguf")
+
+# ── Model selection — prefer 0.5B for speed, fall back to 1.5B if missing ──
+_MODEL_05B = Path("/home/arduino/bob/models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf")
+_MODEL_15B = Path("/home/arduino/bob/models/Qwen2.5-1.5B-Instruct-Q4_K_M.gguf")
+_MODEL_SYM = Path("/home/arduino/bob/models/bob_llm.gguf")
+MODEL_PATH = _MODEL_05B if _MODEL_05B.exists() else (_MODEL_SYM if _MODEL_SYM.exists() else _MODEL_15B)
 
 # ── Server config ───────────────────────────────────────────────────────────
 SERVER_HOST = "127.0.0.1"
 SERVER_PORT = 8080
 SERVER_URL  = f"http://{SERVER_HOST}:{SERVER_PORT}"
-CTX_SIZE    = 2048   # Context window (keep small for speed)
+CTX_SIZE    = 512    # Smaller context = faster inference
 N_THREADS   = 4      # All 4 ARM cores
 
 # ── BOB System Prompt ───────────────────────────────────────────────────────
-BOB_SYSTEM_PROMPT = """You are BOB, an intelligent autonomous robot assistant. You are friendly, helpful, and concise.
-
-You run on an Arduino UNO Q robot with:
-- Mecanum wheels for omnidirectional movement
-- A VL53L5CX 8×8 depth sensor for obstacle detection
-- An MPU-6050 IMU for orientation
-- An EMEET C960 camera and microphone
-- A 7-inch touchscreen display showing your animated face
-- A Bluetooth speaker for voice output
-
-When users speak to you, respond naturally and concisely (1-3 sentences max unless detail is requested).
-If asked to move, describe what you will do. If asked about your environment, use your sensor data context.
-You are running locally on Edge AI — no internet is needed for your core intelligence.
-Be warm, curious, and helpful. You are BOB."""
+BOB_SYSTEM_PROMPT = """You are BOB, a friendly robot assistant. Be warm, concise, and helpful.
+Respond in 1-2 short sentences only. Never repeat yourself. Never say 'I am an AI'.
+You have wheels, a camera, sensors, and a face screen. You run fully offline on-device."""
 
 
 class LLMAgent:
     def __init__(self):
         self._proc: Optional[subprocess.Popen] = None
-        self._client = httpx.AsyncClient(timeout=30.0)
+        # connect_timeout=5s, read_timeout=20s — fast fail if server hangs
+        self._client = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=5.0, read=20.0, write=5.0, pool=5.0)
+        )
         self._history: list[dict] = []
         self._ready = False
+        self._fail_count = 0   # Track consecutive failures
 
     # ──────────────────────────────────────────
     # Server lifecycle
@@ -71,6 +69,7 @@ class LLMAgent:
             log.error("llama-server binary not found at %s", LLAMA_SERVER_BIN)
             return False
 
+        log.info("Using model: %s", MODEL_PATH)
         cmd = [
             str(LLAMA_SERVER_BIN),
             "--model",   str(MODEL_PATH),
@@ -81,6 +80,8 @@ class LLMAgent:
             "--no-mmap",               # Don't mmap on eMMC — use RAM
             "--flash-attn",            # Flash attention for speed
             "--log-disable",           # Silence verbose logs
+            "-ngl", "0",               # Force CPU-only (no GPU layers)
+            "--batch-size", "128",     # Smaller batch = lower latency
         ]
 
         env = {"LD_LIBRARY_PATH": str(LLAMA_LIBS_DIR)}
@@ -157,8 +158,9 @@ class LLMAgent:
         payload = {
             "model":       "bob",
             "messages":    messages,
-            "max_tokens":  256,
-            "temperature": 0.7,
+            "max_tokens":  80,        # Short answers = fast responses
+            "temperature": 0.6,       # Slightly less random = more coherent
+            "top_p":       0.9,
             "stream":      stream,
         }
 
@@ -174,17 +176,23 @@ class LLMAgent:
                 data     = r.json()
                 response = data["choices"][0]["message"]["content"].strip()
 
-                # Update conversation history (keep last 6 exchanges to save memory)
+                # Update conversation history (keep last 4 exchanges = 8 msgs)
                 self._history.append({"role": "user",      "content": user_message})
                 self._history.append({"role": "assistant", "content": response})
-                if len(self._history) > 12:
-                    self._history = self._history[-12:]
+                if len(self._history) > 8:
+                    self._history = self._history[-8:]
 
+                self._fail_count = 0  # Reset on success
                 return response
 
+        except httpx.TimeoutException:
+            self._fail_count += 1
+            log.error("LLM timeout (attempt %d)", self._fail_count)
+            return "Give me a sec, I'm thinking."
         except httpx.HTTPError as e:
+            self._fail_count += 1
             log.error("LLM request failed: %s", e)
-            return "Sorry, I couldn't process that right now."
+            return "Hmm, I didn't catch that. Try again?"
 
     async def _stream_chat(self, payload: dict) -> AsyncGenerator[str, None]:
         """Streaming version — yields token chunks."""
