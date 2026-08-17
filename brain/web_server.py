@@ -47,11 +47,11 @@ import uvicorn
 HOST              = "0.0.0.0"
 PORT              = 8000
 DASHBOARD_DIR     = Path("/home/arduino/bob/dashboard")
-CAMERA_DEVICE     = 0           # /dev/video0
+CAMERA_DEVICE     = 2           # /dev/video2 — EMEET C960
 CAMERA_WIDTH      = 640
 CAMERA_HEIGHT     = 480
-CAMERA_FPS        = 20
-JPEG_QUALITY      = 70
+CAMERA_FPS        = 15          # 15fps saves CPU vs 20fps
+JPEG_QUALITY      = 65
 FRAME_INTERVAL    = 1.0 / CAMERA_FPS
 
 
@@ -127,15 +127,25 @@ class CameraThread(threading.Thread):
             logger.warning("CameraThread: OpenCV not available — thread exiting.")
             return
 
-        logger.info("CameraThread: opening camera /dev/video%d …", CAMERA_DEVICE)
-        cap = cv2.VideoCapture(CAMERA_DEVICE)
+        # Try configured device first, then auto-scan 0..4
+        device = CAMERA_DEVICE
+        cap = cv2.VideoCapture(device)
         if not cap.isOpened():
-            logger.error(
-                "CameraThread: failed to open /dev/video%d. "
-                "Check that the EMEET C960 is connected.",
-                CAMERA_DEVICE,
-            )
-            return
+            logger.warning("CameraThread: /dev/video%d failed — scanning…", device)
+            cap = None
+            for idx in range(5):
+                if idx == device:
+                    continue
+                test = cv2.VideoCapture(idx)
+                if test.isOpened():
+                    cap = test
+                    device = idx
+                    logger.info("CameraThread: found camera at /dev/video%d", idx)
+                    break
+            if cap is None:
+                logger.error("CameraThread: no camera found on /dev/video0-4")
+                return
+        logger.info("CameraThread: opened /dev/video%d", device)
 
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
@@ -279,8 +289,8 @@ class WebServer:
                         status["brain_state"] = str(self._brain.state)
                     if hasattr(self._brain, "telemetry"):
                         status["telemetry"] = self._brain.telemetry
-                    if hasattr(self._brain, "obstacle_distance_cm"):
-                        status["obstacle_distance_cm"] = self._brain.obstacle_distance_cm
+                    if hasattr(self._brain, "obstacle_distance"):
+                        status["obstacle_distance_cm"] = self._brain.obstacle_distance
                 except Exception as exc:
                     logger.warning("Error reading brain state for /api/status: %s", exc)
 
