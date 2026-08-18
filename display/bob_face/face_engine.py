@@ -185,16 +185,14 @@ class FaceEngine:
     # ── Draw ─────────────────────────────────────────────────────────────────
 
     def draw(self, surface: pygame.Surface) -> None:
-        """Render the complete face to the surface."""
-        surface.fill(C.BG_COLOR)
-
-        # Background glow (subtle circle behind face for HAPPY/ERROR states)
-        self._draw_bg_glow(surface)
-
-        # Face body (yellow ellipse with shadow)
+        """Render the complete minion face to the surface."""
+        # 1. Yellow background + black strap
         self._draw_face_body(surface)
 
-        # Build eye params from animated values
+        # 2. Optional tint for emotional states (happy=green tint, error=red tint)
+        self._draw_bg_glow(surface)
+
+        # 3. Eyes (goggles)
         gx, gy = self._gaze.value
         iris_color = (
             int(max(0, min(255, self._iris_r.value))),
@@ -246,51 +244,24 @@ class FaceEngine:
             self._draw_thinking_dots(surface)
 
     def _draw_bg_glow(self, surface: pygame.Surface) -> None:
-        """Subtle colored glow behind face for emotional states."""
+        """Tint the yellow background slightly for emotional states."""
         expr = EXPRESSIONS.get(self._sm.current.value)
         if not expr or not expr.glow_color:
             return
         gc = expr.glow_color
         if len(gc) == 4:
-            glow = pygame.Surface((C.SCREEN_W, C.SCREEN_H), pygame.SRCALPHA)
-            pygame.draw.ellipse(
-                glow,
-                gc,
-                (C.FACE_CX - C.FACE_RX - 40, C.FACE_CY - C.FACE_RY - 40,
-                 (C.FACE_RX + 40) * 2, (C.FACE_RY + 40) * 2),
-            )
-            surface.blit(glow, (0, 0))
+            tint = pygame.Surface((C.SCREEN_W, C.SCREEN_H), pygame.SRCALPHA)
+            tint.fill(gc)
+            surface.blit(tint, (0, 0))
 
     def _draw_face_body(self, surface: pygame.Surface) -> None:
-        """Draw the yellow face ellipse with a subtle shadow."""
-        # Shadow
-        shadow_rect = pygame.Rect(
-            C.FACE_CX - C.FACE_RX + 8,
-            C.FACE_CY - C.FACE_RY + 12,
-            C.FACE_RX * 2,
-            C.FACE_RY * 2,
-        )
-        shadow_surf = pygame.Surface((C.FACE_RX * 2, C.FACE_RY * 2), pygame.SRCALPHA)
-        pygame.draw.ellipse(shadow_surf, (0, 0, 0, 60), shadow_surf.get_rect())
-        surface.blit(shadow_surf, shadow_rect.topleft)
+        """Draw minion face: solid yellow + black goggle strap edge-to-edge."""
+        # Full yellow background
+        surface.fill(C.BG_COLOR)
 
-        # Main face
-        face_rect = pygame.Rect(
-            C.FACE_CX - C.FACE_RX,
-            C.FACE_CY - C.FACE_RY,
-            C.FACE_RX * 2,
-            C.FACE_RY * 2,
-        )
-        pygame.draw.ellipse(surface, C.FACE_COLOR, face_rect)
-
-        # Highlight (top-left sheen)
-        hi_surf = pygame.Surface((C.FACE_RX * 2, C.FACE_RY * 2), pygame.SRCALPHA)
-        hi_rect = pygame.Rect(C.FACE_RX - 180, C.FACE_RY - 140, 300, 200)
-        pygame.draw.ellipse(hi_surf, (255, 255, 255, 25), hi_rect)
-        surface.blit(hi_surf, face_rect.topleft)
-
-        # Outline
-        pygame.draw.ellipse(surface, C.FACE_SHADOW, face_rect, 4)
+        # Black goggle strap — goes full width
+        strap_rect = pygame.Rect(0, C.STRAP_Y1, C.SCREEN_W, C.STRAP_H)
+        pygame.draw.rect(surface, C.STRAP_COLOR, strap_rect)
 
     def _draw_subtitle(self, surface: pygame.Surface) -> None:
         """Draw subtitle text bar at bottom."""
@@ -307,10 +278,10 @@ class FaceEngine:
 
         bar_h = 44
         bar_surf = pygame.Surface((C.SCREEN_W, bar_h), pygame.SRCALPHA)
-        bar_surf.fill((15, 15, 15, int(180 * alpha / 255)))
+        bar_surf.fill((20, 15, 5, int(200 * alpha / 255)))
         surface.blit(bar_surf, (0, C.SCREEN_H - bar_h))
 
-        text_surf = self._font.render(self._subtitle_text, True, C.SUBTITLE_FG)
+        text_surf = self._font.render(self._subtitle_text, True, (255, 255, 255))
         text_surf.set_alpha(alpha)
         tx = (C.SCREEN_W - text_surf.get_width()) // 2
         ty = C.SCREEN_H - bar_h + (bar_h - text_surf.get_height()) // 2

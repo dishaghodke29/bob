@@ -68,17 +68,18 @@ def draw_mouth(
     open_amount = max(0.0, min(1.0, params.open_amount))
     smile       = max(-1.0, min(1.0, params.smile))
 
-    # Upper lip control point — smile raises corners UP (negative Y)
-    upper_ctrl_y = cy - int(smile * 45)
-    # Lower lip control point — drops down proportional to open_amount
+    # Upper lip control point — smile pulls control point DOWN (+Y) to make a U shape
+    upper_ctrl_y = cy + int(smile * 45)
+    
+    # Lower lip control point — drops further down proportional to open_amount
     open_px       = int(open_amount * C.MOUTH_H * 0.9)
-    lower_ctrl_y  = cy + open_px
+    lower_ctrl_y  = cy + int(smile * 45) + open_px
 
     if open_amount < 0.06:
         # ── CLOSED mouth: just a curved line ─────────────────────────────────
         pts = _quad_bezier((lx, ly), (cx, upper_ctrl_y), (rx, ry), steps=28)
         if len(pts) >= 2:
-            pygame.draw.lines(surface, C.MOUTH_COLOR, False, pts, 7)
+            pygame.draw.lines(surface, C.MOUTH_COLOR, False, pts, 8)
         # Rounded corner dots
         pygame.draw.circle(surface, C.MOUTH_COLOR, (lx, ly), 4)
         pygame.draw.circle(surface, C.MOUTH_COLOR, (rx, ry), 4)

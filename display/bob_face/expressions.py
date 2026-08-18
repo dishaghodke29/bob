@@ -46,21 +46,23 @@ EXPRESSIONS: dict[str, ExpressionParams] = {
         brow_height     = 0.0,
         brow_angle      = 0.0,
         pupil_size      = 1.0,
-        smile           = 0.25,
+        pupil_target_x  = 0.25,
+        pupil_target_y  = 0.25,
+        smile           = 0.8,
         mouth_open      = 0.0,
         blink_rate_mult = 1.0,
         idle_wander     = True,
     ),
 
     "listening": ExpressionParams(
-        eye_openness    = 1.08,          # slightly wider = attentive
+        eye_openness    = 1.08,
         brow_height     = 0.3,
         brow_angle      = 0.0,
         pupil_size      = 1.05,
-        pupil_target_y  = -0.12,         # slight upward gaze (toward user's face)
-        smile           = 0.15,
+        pupil_target_y  = -0.12,
+        smile           = 0.7,
         mouth_open      = 0.0,
-        blink_rate_mult = 0.6,           # less blinking = attentive
+        blink_rate_mult = 0.6,
         idle_wander     = False,
     ),
 
