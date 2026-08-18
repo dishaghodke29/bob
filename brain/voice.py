@@ -2,8 +2,9 @@
 voice.py — BOB Robot Voice Pipeline
 =====================================
 Speech-to-Text : faster-whisper  (tiny model, CPU, int8)
-Text-to-Speech : piper-tts → ffmpeg audio filter (T3 throat-resonant voice)
-Microphone     : EMEET C960 USB mic, auto-detected (falls back to hw:1,0)
+Text-to-Speech : piper-tts → ffmpeg T3 filter → aplay (hw:0,0)
+Wake Word      : "hey bob" or "bob" — responds only when called
+Microphone     : EMEET C960 USB mic, auto-detected
 Platform       : Debian Linux arm64 (Arduino UNO Q)
 """
 
@@ -11,10 +12,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import re
 import subprocess
-import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -25,33 +24,38 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 # ──────────────────────────── Constants ──────────────────────────────────────
-SAMPLE_RATE       = 16_000    # Hz — required by Whisper
-CHUNK_SECONDS     = 3         # seconds per recording chunk
-CHUNK_FRAMES      = SAMPLE_RATE * CHUNK_SECONDS
-NO_SPEECH_THRESH  = 0.55      # drop segment if no_speech_prob is above this
+SAMPLE_RATE      = 16_000
+CHUNK_SECONDS    = 3
+CHUNK_FRAMES     = SAMPLE_RATE * CHUNK_SECONDS
+NO_SPEECH_THRESH = 0.55
 
 # Piper TTS settings
-PIPER_BIN         = "/home/arduino/bob/venv/bin/piper"
-PIPER_MODEL       = "/home/arduino/bob/models/en_US-amy-medium.onnx"
-PIPER_MODEL_JSON  = "/home/arduino/bob/models/en_US-amy-medium.onnx.json"
+PIPER_BIN    = "/home/arduino/bob/venv/bin/piper"
+PIPER_MODEL  = "/home/arduino/bob/models/en_US-amy-medium.onnx"
 
-# T3 Throat-Resonant voice filter chain for ffmpeg
-# Deepens pitch slightly, boosts chest/throat frequencies, tamps highs
+# Audio output: use PipeWire (same as YouTube/system audio → routes to BT or 3.5mm)
+# PipeWire is confirmed running on this board
+USE_PIPEWIRE = True   # set False to fall back to aplay
+
+# T3 Throat-Resonant voice filter — deep, warm, grounded
 T3_FILTER = (
-    "volume=0.72,"
-    "asetrate=22050*1.26,"
+    "volume=0.85,"
+    "asetrate=22050*0.88,"       # slightly deeper pitch
     "aresample=22050,"
-    "equalizer=f=620:width_type=h:w=280:g=11,"
-    "equalizer=f=1380:width_type=h:w=400:g=7,"
-    "equalizer=f=2800:width_type=h:w=500:g=4,"
-    "atempo=0.94"
+    "equalizer=f=180:width_type=h:w=120:g=6,"   # sub-bass warmth
+    "equalizer=f=520:width_type=h:w=200:g=8,"   # chest resonance
+    "equalizer=f=1200:width_type=h:w=350:g=4,"  # throat presence
+    "equalizer=f=3500:width_type=h:w=600:g=-3," # de-harsh highs
+    "atempo=0.96"                # slightly slower = more authoritative
 )
+
+# Wake word — BOB responds only when one of these is detected
+WAKE_WORDS = ["hey bob", "hey, bob", "ok bob", "okay bob", "bob"]
 
 # ──────────────────────────── Optional imports ────────────────────────────────
 try:
     import sounddevice as sd
     _HAS_SD = True
-    logger.debug("sounddevice available")
 except ImportError:
     sd = None  # type: ignore
     _HAS_SD = False
@@ -68,51 +72,37 @@ except ImportError:
 
 # ═════════════════════════════════════════════════════════════════════════════
 class VoicePipeline:
-    """
-    Async voice pipeline for BOB.
-
-    Usage::
-
-        vp = VoicePipeline()
-        await vp.start()
-        await vp.speak("Hello, I am BOB.")
-        await vp.listen_loop(callback=my_async_callback)
-        await vp.stop()
-    """
+    """Async voice pipeline: mic → Whisper STT → wake-word → callback → Piper TTS."""
 
     def __init__(self) -> None:
         self._whisper: Optional[WhisperModel] = None
         self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="voice")
         self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._running   = False
-        self._speaking  = False   # True while BOB is playing audio (mic muted)
-        self._mic_index: Optional[int] = None   # sounddevice device index
+        self._running  = False
+        self._speaking = False
+        self._mic_index: Optional[int] = None
+        self._wake_active = False  # True after wake word detected (stays active 30s)
+        self._wake_timer: Optional[asyncio.TimerHandle] = None
 
     # ──────────────────────── Lifecycle ──────────────────────────────────────
 
     async def start(self) -> None:
-        """Load Whisper model and detect microphone."""
         self._loop    = asyncio.get_running_loop()
         self._running = True
 
-        # Detect EMEET mic
         self._mic_index = self._find_emeet_mic()
         if self._mic_index is not None:
-            logger.info("EMEET C960 mic found at device index %d", self._mic_index)
+            logger.info("EMEET C960 mic at device index %d", self._mic_index)
         else:
             logger.warning("EMEET C960 not found — using default mic")
 
-        # Verify piper binary
         if not Path(PIPER_BIN).exists():
-            logger.warning("piper not found at %s — TTS will be silent", PIPER_BIN)
-        else:
-            logger.info("Piper TTS ready (%s)", PIPER_BIN)
-
-        # Verify piper model
-        if not Path(PIPER_MODEL).exists():
+            logger.warning("piper not found at %s", PIPER_BIN)
+        elif not Path(PIPER_MODEL).exists():
             logger.warning("Piper model not found at %s", PIPER_MODEL)
+        else:
+            logger.info("Piper TTS ready")
 
-        # Load STT model
         if _HAS_WHISPER:
             logger.info("Loading Whisper tiny model (CPU/int8)…")
             try:
@@ -120,49 +110,71 @@ class VoicePipeline:
                     self._executor,
                     lambda: WhisperModel("tiny", device="cpu", compute_type="int8"),
                 )
-                logger.info("Whisper model loaded.")
+                logger.info("Whisper loaded ✓")
             except Exception as exc:
-                logger.error("Whisper load failed: %s", exc, exc_info=True)
-                self._whisper = None
-        else:
-            logger.warning("faster-whisper missing — STT unavailable")
+                logger.error("Whisper load failed: %s", exc)
 
-        # Warm up piper (avoids first-speak delay)
+        # Warm up piper after 4s delay
         asyncio.create_task(self._warmup_tts())
 
     async def _warmup_tts(self) -> None:
-        """Silently warm up Piper so first real speak has no init delay."""
-        await asyncio.sleep(3)
-        await self._loop.run_in_executor(
+        await asyncio.sleep(4)
+        loop = self._loop or asyncio.get_running_loop()
+        await loop.run_in_executor(
             self._executor,
             lambda: self._blocking_speak(".", silent=True),
         )
-        logger.info("TTS warmed up.")
+        logger.info("TTS warmed up ✓")
 
     async def stop(self) -> None:
-        """Stop the pipeline and clean up."""
-        logger.info("Stopping VoicePipeline…")
         self._running = False
         self._executor.shutdown(wait=False)
-        logger.info("VoicePipeline stopped.")
+
+    # ──────────────────────── Wake Word ──────────────────────────────────────
+
+    def _check_wake_word(self, text: str) -> tuple[bool, str]:
+        """
+        Check if text contains a wake word.
+        Returns (wake_detected, text_after_wake_word).
+        """
+        lower = text.lower().strip()
+        for word in WAKE_WORDS:
+            if lower.startswith(word):
+                remainder = text[len(word):].strip(" ,!?.")
+                return True, remainder
+            if word in lower:
+                # Wake word anywhere in utterance
+                idx = lower.find(word)
+                remainder = text[idx + len(word):].strip(" ,!?.")
+                return True, remainder
+        return False, text
+
+    def _activate_wake(self) -> None:
+        """Activate wake mode for 30 seconds."""
+        if self._wake_timer:
+            self._wake_timer.cancel()
+        self._wake_active = True
+        loop = self._loop
+        if loop:
+            self._wake_timer = loop.call_later(30, self._deactivate_wake)
+        logger.info("Wake mode ON (30s window)")
+
+    def _deactivate_wake(self) -> None:
+        self._wake_active = False
+        logger.info("Wake mode OFF — say 'Hey BOB' to activate")
 
     # ──────────────────────── TTS ─────────────────────────────────────────────
 
     async def speak(self, text: str) -> None:
-        """
-        Speak *text* via Piper TTS with T3 throat filter.
-        Mutes mic during playback to prevent feedback loops.
-        """
         if not text or not text.strip():
             return
-
-        # Clean text — remove markdown/special chars that piper can't pronounce
         clean = re.sub(r"[*_`#\[\]{}|<>]", "", text).strip()
         if not clean:
             return
-
-        logger.info("TTS ▶ %r", clean)
+        logger.info("TTS ▶ %r", clean[:60])
         self._speaking = True
+        # Extend wake window while BOB is speaking
+        self._activate_wake()
         try:
             loop = self._loop or asyncio.get_running_loop()
             await loop.run_in_executor(
@@ -173,70 +185,59 @@ class VoicePipeline:
             self._speaking = False
 
     def _blocking_speak(self, text: str, silent: bool = False) -> None:
-        """
-        Run piper → ffmpeg pipeline in a blocking thread.
-        Piper generates raw PCM → ffmpeg applies T3 filter → plays via aplay.
-        """
+        """Piper → ffmpeg T3 filter → aplay (hw:0,0)  fully streamed."""
+        piper_proc = ffmpeg_proc = aplay_proc = None
         try:
             if not Path(PIPER_BIN).exists() or not Path(PIPER_MODEL).exists():
+                logger.error("Piper binary or model not found")
                 return
 
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                tmp_path = tmp.name
+            piper_proc = subprocess.Popen(
+                [PIPER_BIN, "--model", PIPER_MODEL, "--output-raw"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
 
-            try:
-                # Step 1: Piper generates raw WAV
-                piper_cmd = [
-                    PIPER_BIN,
-                    "--model", PIPER_MODEL,
-                    "--output_file", tmp_path,
-                ]
-                piper_proc = subprocess.run(
-                    piper_cmd,
-                    input=text.encode("utf-8"),
-                    capture_output=True,
-                    timeout=10,
-                )
-                if piper_proc.returncode != 0:
-                    logger.error("Piper error: %s", piper_proc.stderr.decode())
-                    return
+            if silent:
+                piper_proc.communicate(input=text.encode("utf-8"), timeout=60)
+                return
 
-                if silent:
-                    return  # warm-up: don't play audio
-
-                # Step 2: ffmpeg applies T3 filter, outputs to aplay
-                ffmpeg_cmd = [
+            ffmpeg_proc = subprocess.Popen(
+                [
                     "ffmpeg", "-y",
-                    "-i", tmp_path,
+                    "-f", "s16le", "-ar", "22050", "-ac", "1",
+                    "-i", "pipe:0",
                     "-af", T3_FILTER,
-                    "-f", "wav",
-                    "pipe:1",
-                ]
-                aplay_cmd = ["aplay", "-q"]
+                    "-f", "wav", "pipe:1",
+                ],
+                stdin=piper_proc.stdout,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
 
-                ffmpeg_proc = subprocess.Popen(
-                    ffmpeg_cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,
-                )
-                aplay_proc = subprocess.Popen(
-                    aplay_cmd,
-                    stdin=ffmpeg_proc.stdout,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-                ffmpeg_proc.stdout.close()
-                aplay_proc.wait(timeout=30)
-                ffmpeg_proc.wait()
+            aplay_proc = subprocess.Popen(
+                ["aplay", "-q", "-D", APLAY_DEVICE],
+                stdin=ffmpeg_proc.stdout,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
 
-            finally:
-                try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
+            piper_proc.stdin.write(text.encode("utf-8"))
+            piper_proc.stdin.close()
+            piper_proc.stdout.close()
+            ffmpeg_proc.stdout.close()
+
+            aplay_proc.wait(timeout=60)
+            ffmpeg_proc.wait(timeout=5)
+            piper_proc.wait(timeout=5)
 
         except subprocess.TimeoutExpired:
-            logger.error("TTS timeout — piper took too long")
+            logger.error("TTS timeout — killing pipeline")
+            for p in [aplay_proc, ffmpeg_proc, piper_proc]:
+                if p:
+                    try: p.kill()
+                    except Exception: pass
         except Exception as exc:
             logger.error("TTS error: %s", exc, exc_info=True)
 
@@ -247,63 +248,76 @@ class VoicePipeline:
         callback: Callable[[str], Awaitable[None]],
     ) -> None:
         """
-        Continuously record audio from the EMEET C960 mic in 3-second chunks,
-        transcribe with Whisper, and call *callback(text)* when speech detected.
-        Mic is automatically muted while BOB is speaking.
+        Record 3s audio chunks → Whisper STT → wake-word check → callback.
+        Only calls callback if 'hey bob' (or similar) is detected OR
+        if already in an active wake window (30s after last activation).
         """
-        if not _HAS_SD:
-            logger.error("sounddevice not installed — listen_loop disabled")
+        if not _HAS_SD or self._whisper is None:
+            logger.error("STT not available — listen_loop disabled")
             return
 
-        if self._whisper is None:
-            logger.error("Whisper not loaded — listen_loop disabled")
-            return
-
-        logger.info(
-            "Listening (mic_index=%s, rate=%d Hz, chunk=%ds)",
-            self._mic_index, SAMPLE_RATE, CHUNK_SECONDS,
-        )
-
+        logger.info("Listening for wake word ('Hey BOB') — mic_index=%s", self._mic_index)
         loop = self._loop or asyncio.get_running_loop()
 
         while self._running:
             try:
-                # Pause while BOB is speaking (avoid picking up own voice)
                 if self._speaking:
                     await asyncio.sleep(0.1)
                     continue
 
-                # Record chunk
                 audio_np = await loop.run_in_executor(
                     self._executor, self._record_chunk
                 )
-
                 if audio_np is None:
                     await asyncio.sleep(0.5)
                     continue
 
-                # Skip if still speaking (recorded while speaking)
                 if self._speaking:
                     continue
 
-                # Transcribe
                 text = await loop.run_in_executor(
                     self._executor,
                     lambda a=audio_np: self._transcribe(a),
                 )
 
-                if text:
-                    logger.info("STT: %r", text)
+                if not text:
+                    continue
+
+                # Check for wake word
+                has_wake, query = self._check_wake_word(text)
+
+                if has_wake:
+                    self._activate_wake()
+                    if query:
+                        # Wake word + question in same utterance → answer directly
+                        logger.info("Wake+Query: %r", query)
+                        try:
+                            await callback(query)
+                        except Exception as exc:
+                            logger.error("Callback error: %s", exc)
+                    else:
+                        # Just the wake word — respond with a greeting
+                        logger.info("Wake word detected — greeting")
+                        try:
+                            await callback("hello")
+                        except Exception as exc:
+                            logger.error("Callback error: %s", exc)
+
+                elif self._wake_active:
+                    # Already in wake window — answer follow-up questions
+                    logger.info("Follow-up (wake active): %r", text)
+                    self._activate_wake()   # reset 30s timer
                     try:
                         await callback(text)
                     except Exception as exc:
-                        logger.error("Callback error: %s", exc, exc_info=True)
+                        logger.error("Callback error: %s", exc)
+                else:
+                    logger.debug("Ignored (no wake word): %r", text[:40])
 
             except asyncio.CancelledError:
-                logger.info("listen_loop cancelled.")
                 break
             except Exception as exc:
-                logger.error("listen_loop error: %s", exc, exc_info=True)
+                logger.error("listen_loop error: %s", exc)
                 await asyncio.sleep(1.0)
 
         logger.info("listen_loop exited.")
@@ -311,7 +325,6 @@ class VoicePipeline:
     # ──────────────────────── Helpers ────────────────────────────────────────
 
     def _find_emeet_mic(self) -> Optional[int]:
-        """Find EMEET C960 microphone in sounddevice device list."""
         if not _HAS_SD:
             return None
         try:
@@ -319,23 +332,14 @@ class VoicePipeline:
             for i, dev in enumerate(devices):
                 name = dev.get("name", "").lower()
                 if dev.get("max_input_channels", 0) > 0 and (
-                    "emeet" in name or "c960" in name or "usb" in name
+                    "emeet" in name or "c960" in name
                 ):
-                    logger.info("Found input mic: [%d] %s", i, dev["name"])
                     return i
-            # Fall back to default input device
-            default = sd.default.device[0]
-            logger.warning("EMEET not found — using default input device %d", default)
             return None
-        except Exception as exc:
-            logger.warning("Mic detection error: %s", exc)
+        except Exception:
             return None
 
     def _record_chunk(self) -> Optional[np.ndarray]:
-        """
-        Record CHUNK_FRAMES samples from mic.
-        Returns float32 numpy array [-1, 1], or None on error.
-        """
         try:
             kwargs: dict = {
                 "frames":     CHUNK_FRAMES,
@@ -346,58 +350,24 @@ class VoicePipeline:
             }
             if self._mic_index is not None:
                 kwargs["device"] = self._mic_index
-
             audio = sd.rec(**kwargs)
             return audio.flatten()
         except Exception as exc:
-            logger.error("Recording error: %s", exc, exc_info=True)
+            logger.error("Recording error: %s", exc)
             return None
 
     def _transcribe(self, audio: np.ndarray) -> str:
-        """Transcribe float32 audio → text string, or '' if not confident."""
         try:
             segments, _ = self._whisper.transcribe(
                 audio,
                 language="en",
-                beam_size=1,        # greedy = fastest for tiny model
-                vad_filter=True,    # skip silent chunks
+                beam_size=1,
+                vad_filter=True,
                 vad_parameters={"min_silence_duration_ms": 300},
             )
-
-            parts: list[str] = []
-            for seg in segments:
-                if seg.no_speech_prob < NO_SPEECH_THRESH:
-                    parts.append(seg.text.strip())
-
-            result = " ".join(parts).strip()
-            return result
-
+            parts = [seg.text.strip() for seg in segments
+                     if seg.no_speech_prob < NO_SPEECH_THRESH]
+            return " ".join(parts).strip()
         except Exception as exc:
-            logger.error("Transcription error: %s", exc, exc_info=True)
+            logger.error("Transcription error: %s", exc)
             return ""
-
-
-# ─────────────────────────── Quick self-test ─────────────────────────────────
-if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.DEBUG,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
-
-    async def _test() -> None:
-        vp = VoicePipeline()
-        await vp.start()
-        await vp.speak("Hey, I am BOB. Voice pipeline is working perfectly.")
-
-        async def _cb(text: str) -> None:
-            print(f"[callback] Heard: {text!r}")
-            await vp.speak(f"You said: {text}")
-
-        try:
-            await vp.listen_loop(_cb)
-        except KeyboardInterrupt:
-            pass
-        finally:
-            await vp.stop()
-
-    asyncio.run(_test())

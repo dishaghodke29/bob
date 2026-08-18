@@ -7,6 +7,7 @@ Usage (on UNO Q):
   python3 /home/arduino/bob/brain/main.py
 
 NOTE: llama-server must already be running (started by start_bob.sh).
+NOTE: Web server is disabled — saves ~15% CPU. Re-enable if needed.
 """
 
 import asyncio
@@ -14,26 +15,34 @@ import logging
 import sys
 import os
 
-# Ensure project root is in path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from brain.serial_bridge import SerialBridge
 from brain.llm_agent     import LLMAgent
 from brain.voice         import VoicePipeline
 from brain.tof_sensor    import ToFSensor
-from brain.web_server    import WebServer
 from brain.bob_brain     import BobBrain
 
-# ── Logging setup ────────────────────────────────────────────────────────────
+# ── Logging — single handler only, no duplicate lines ────────────────────────
+log_handlers = [
+    logging.StreamHandler(),
+    logging.FileHandler("/home/arduino/bob/logs/brain.log", mode="w"),  # overwrite each run
+]
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(name)-14s] %(levelname)s: %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler("/home/arduino/bob/logs/brain.log"),
-    ],
+    handlers=log_handlers,
+    force=True,   # removes any existing handlers (prevents duplicates)
 )
+# Silence noisy libs
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("uvicorn").setLevel(logging.WARNING)
+logging.getLogger("faster_whisper").setLevel(logging.WARNING)
+
 log = logging.getLogger("main")
+
+ENABLE_WEB_SERVER = False   # Disabled — saves ~200MB RAM + 15% CPU
 
 
 async def main():
@@ -41,46 +50,45 @@ async def main():
     log.info("  BOB Brain Starting Up")
     log.info("=" * 50)
 
-    # ── Instantiate all subsystems ────────────────────────────────────────────
     telemetry_queue = asyncio.Queue(maxsize=10)
 
-    serial  = SerialBridge(telemetry_queue)
-    llm     = LLMAgent()
-    voice   = VoicePipeline()
-    tof     = ToFSensor()
-    web     = WebServer()
+    serial = SerialBridge(telemetry_queue)
+    llm    = LLMAgent()
+    voice  = VoicePipeline()
+    tof    = ToFSensor()
+
+    # Dummy broadcaster if web server is off
+    async def noop_broadcast(msg: dict) -> None:
+        pass
 
     brain = BobBrain(
         serial_bridge  = serial,
         llm_agent      = llm,
         voice          = voice,
         tof_sensor     = tof,
-        ws_broadcaster = web.broadcast,
+        ws_broadcaster = noop_broadcast,
     )
-    web.set_brain(brain)
 
-    # ── Start LLM (connect to already-running llama-server) ───────────────────
+    # ── Start LLM ─────────────────────────────────────────────────────────────
     log.info("Connecting to llama-server…")
     llm_ok = await llm.start()
     if not llm_ok:
-        log.warning("LLM not ready — BOB will respond with fallback messages until it is")
+        log.warning("LLM not ready yet — will retry on first voice input")
 
     # ── Start voice pipeline ──────────────────────────────────────────────────
     log.info("Starting voice pipeline…")
     await voice.start()
 
-    # ── Start ToF sensor ──────────────────────────────────────────────────────
-    log.info("Starting ToF sensor…")
+    # ── Start ToF (optional) ──────────────────────────────────────────────────
     tof_ok = await tof.start()
     if not tof_ok:
-        log.warning("VL53L5CX not available — running without depth sensor")
+        log.warning("ToF sensor not available — running without depth sensor")
 
-    log.info("All systems initialised — BOB is running!")
+    log.info("All systems ready — say 'Hey BOB' to start talking!")
 
-    # ── Background consumers ──────────────────────────────────────────────────
+    # ── Background tasks ──────────────────────────────────────────────────────
 
     async def telemetry_consumer():
-        """Drain MCU telemetry from queue and update brain."""
         while True:
             try:
                 data = await asyncio.wait_for(telemetry_queue.get(), timeout=1.0)
@@ -88,42 +96,46 @@ async def main():
             except asyncio.TimeoutError:
                 pass
             except Exception as exc:
-                log.error("Telemetry consumer error: %s", exc)
+                log.error("Telemetry error: %s", exc)
 
     async def tof_consumer():
-        """Stream depth frames from ToF sensor into brain."""
         async for depth_map in tof.stream():
             try:
                 brain.update_tof(depth_map)
             except Exception as exc:
                 log.error("ToF consumer error: %s", exc)
 
-    async def serial_graceful():
-        """Run serial bridge — don't crash everything if MCU is not connected."""
+    async def serial_task():
+        """Serial bridge — won't crash if MCU not connected."""
         try:
             await serial.start()
         except Exception as exc:
-            log.warning("Serial bridge exited: %s (MCU may not be connected)", exc)
+            log.warning("Serial bridge stopped: %s (MCU may not be connected)", exc)
 
-    # ── Run everything concurrently ───────────────────────────────────────────
+    # ── Gather all tasks ──────────────────────────────────────────────────────
     tasks = [
-        asyncio.create_task(serial_graceful(),                  name="serial"),
-        asyncio.create_task(brain.run(),                        name="brain"),
-        asyncio.create_task(web.start(),                        name="web"),
-        asyncio.create_task(telemetry_consumer(),               name="telemetry"),
-        asyncio.create_task(voice.listen_loop(brain.handle_voice_input), name="listen"),
+        asyncio.create_task(serial_task(),                                  name="serial"),
+        asyncio.create_task(brain.run(),                                    name="brain"),
+        asyncio.create_task(telemetry_consumer(),                           name="telemetry"),
+        asyncio.create_task(voice.listen_loop(brain.handle_voice_input),    name="listen"),
     ]
     if tof_ok:
         tasks.append(asyncio.create_task(tof_consumer(), name="tof"))
 
+    if ENABLE_WEB_SERVER:
+        from brain.web_server import WebServer
+        web = WebServer()
+        web.set_brain(brain)
+        tasks.append(asyncio.create_task(web.start(), name="web"))
+        log.info("Web dashboard: http://192.168.1.20:8000")
+
     try:
-        # Run forever — if ANY critical task dies, log it but keep the rest going
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
         for t in done:
             if t.exception():
-                log.error("Task '%s' raised: %s", t.get_name(), t.exception())
+                log.error("Task '%s' crashed: %s", t.get_name(), t.exception())
     except (KeyboardInterrupt, asyncio.CancelledError):
-        log.info("Shutdown signal received…")
+        log.info("Shutdown signal…")
     finally:
         log.info("Shutting down BOB…")
         for t in tasks:

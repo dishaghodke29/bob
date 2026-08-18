@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import socket
+import subprocess
 import time
 from enum import Enum, auto
 from typing import Optional
@@ -16,6 +17,14 @@ from typing import Optional
 log = logging.getLogger("bob_brain")
 
 DISPLAY_SOCKET = "/tmp/bob_display.sock"
+CAMERA_DEVICE  = 2   # /dev/video2 — EMEET C960
+
+# Keywords that trigger on-demand camera capture
+VISION_KEYWORDS = [
+    "what do you see", "look", "what's in front", "what is in front",
+    "describe", "can you see", "is there", "check around",
+    "any obstacle", "whats around", "what around",
+]
 
 # ── Robot states ─────────────────────────────────────────────────────────────
 class State(Enum):
@@ -73,6 +82,14 @@ class BobBrain:
             "pitch":       round(self._telemetry.get("pitch", 0), 1),
         }
 
+        # On-demand camera: only capture if user is asking about vision
+        lower_text = text.lower()
+        if any(kw in lower_text for kw in VISION_KEYWORDS):
+            log.info("Vision keyword detected — capturing single frame")
+            frame_desc = await self._capture_frame_description()
+            if frame_desc:
+                context["camera"] = frame_desc
+
         response = await self._llm.chat(text, context=context)
         log.info("LLM response: %s", response)
 
@@ -84,6 +101,74 @@ class BobBrain:
 
         self._set_state(State.IDLE)
         self._send_display({"type": "emotion", "name": "idle"})
+
+    async def _capture_frame_description(self) -> Optional[str]:
+        """
+        Open camera, grab ONE frame, close camera immediately.
+        Returns a simple description string for the LLM context.
+        Takes ~800ms. Camera is not held open.
+        """
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._blocking_capture)
+
+    def _blocking_capture(self) -> Optional[str]:
+        """Blocking camera capture in a thread executor."""
+        try:
+            import cv2  # type: ignore
+        except ImportError:
+            log.warning("cv2 not installed — camera capture unavailable")
+            return None
+
+        cap = None
+        try:
+            # Try configured device, then scan 0-4
+            for idx in [CAMERA_DEVICE, 0, 1, 2, 3]:
+                cap = cv2.VideoCapture(idx)
+                if cap.isOpened():
+                    break
+                cap.release()
+                cap = None
+
+            if cap is None:
+                log.warning("No camera found for on-demand capture")
+                return None
+
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH,  320)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
+
+            # Grab a few frames to let auto-exposure settle
+            for _ in range(3):
+                cap.read()
+
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                return None
+
+            # Simple brightness / presence analysis
+            gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            mean  = float(gray.mean())
+            edges = cv2.Canny(gray, 50, 150)
+            edge_density = float(edges.mean())
+
+            if mean < 30:
+                desc = "very dark scene, possibly lights off"
+            elif mean > 200:
+                desc = "very bright scene"
+            elif edge_density > 15:
+                desc = "a scene with objects or people present"
+            else:
+                desc = "a mostly clear area"
+
+            log.info("Camera capture: brightness=%.0f, edges=%.1f → '%s'",
+                     mean, edge_density, desc)
+            return desc
+
+        except Exception as exc:
+            log.error("Camera capture error: %s", exc)
+            return None
+        finally:
+            if cap is not None:
+                cap.release()
 
     async def handle_web_command(self, cmd: dict):
         """Handle commands from the web dashboard."""

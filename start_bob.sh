@@ -53,8 +53,6 @@ nohup "$LLAMA_BIN" \
     --ctx-size 512 \
     --threads  4 \
     --batch-size 128 \
-    --no-mmap \
-    --flash-attn \
     --log-disable \
     -ngl 0 \
     > "$LOG_DIR/llama.log" 2>&1 &
