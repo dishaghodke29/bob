@@ -1,0 +1,20 @@
+[Unit]
+Description=BOB Face Engine — fullscreen face display
+After=graphical-session.target
+Wants=graphical-session.target
+
+[Service]
+Type=simple
+User=arduino
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/home/arduino/.Xauthority
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+WorkingDirectory=/home/arduino/bob/display
+ExecStart=/home/arduino/bob/venv/bin/python3 -m bob_face
+Restart=on-failure
+RestartSec=3
+# Give the display time to be ready after login
+ExecStartPre=/bin/sleep 5
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,0 +1,11 @@
+# BOB Face Engine — Python dependencies
+# Install with: pip install -r requirements.txt
+
+# Core rendering
+pygame==2.6.1
+
+# No other runtime dependencies needed!
+# Everything else uses stdlib: threading, socket, json, math, time, enum
+
+# ── Dev / optional ────────────────────────────────────────────────────────────
+# numpy          # only needed if you add NumPy-based effects later
